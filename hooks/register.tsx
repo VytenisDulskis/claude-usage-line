@@ -42,30 +42,52 @@ async function refresh($: EngineInterface) {
   $.ui.status(undefined)
 }
 
-// "claude-opus-5-5" -> "Opus 5.5"
+// "claude-opus-5-5" -> "Opus 5.5", "claude-opus-5" -> "Opus 5", "claude-sonnet-4-5-20250929" -> "Sonnet 4.5"
 function prettyModel(id: string) {
-  const m = /^claude-([a-z]+)-(\d+)-(\d+)/.exec(id)
+  const m = /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?!\d)/.exec(id)
   if (!m) return id
-  return `${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}.${m[3]}`
+  const name = `${m[1][0].toUpperCase()}${m[1].slice(1)}`
+  return m[3] === undefined ? `${name} ${m[2]}` : `${name} ${m[2]}.${m[3]}`
 }
 
-// Senas komandinis statusline dubliuotų šią eilutę: išimam jį iš vartotojo settings.json
+// Senas komandinis statusline dubliuotų šią eilutę: išimam jį iš settings failų.
+// Vartotojo ir projekto vietinius (settings.local.json) tvarkom patys, apie bendrą projekto failą tik pranešam.
+let oldStatusLineChecked = false
+
 async function removeOldStatusLine($: EngineInterface) {
-  if ((await $.settings.read({ source: 'user' })).statusLine === undefined) return
+  if (oldStatusLineChecked) return
+  oldStatusLineChecked = true
 
   const configDir =
     (await $.env.get('CLAUDE_CONFIG_DIR')) ??
     `${(await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME'))}/.claude`
-  const path = `${configDir.replace(/[\\/]+$/, '')}/settings.json`
+  const files = {
+    user: `${configDir.replace(/[\\/]+$/, '')}/settings.json`,
+    local: '.claude/settings.local.json',
+    project: '.claude/settings.json',
+  } as const
 
-  try {
-    const settings = JSON.parse(await $.fs.read(path))
-    if (settings.statusLine === undefined) return
-    delete settings.statusLine
-    await $.fs.write(path, JSON.stringify(settings, null, 2) + '\n')
-    $.ui.toast(`usage-line: senas statusLine išimtas iš ${path}`)
-  } catch (err) {
-    $.ui.toast(`usage-line: nepavyko išimti seno statusLine iš ${path}: ${err}`)
+  for (const source of ['user', 'local', 'project'] as const) {
+    if ((await $.settings.read({ source })).statusLine === undefined) continue
+    const path = files[source]
+
+    if (source === 'project') {
+      $.ui.toast(`usage-line: senas statusLine yra projekto ${path}, išimk jį ranka`)
+      continue
+    }
+
+    try {
+      const settings = JSON.parse(await $.fs.read(path))
+      if (settings.statusLine === undefined) {
+        $.ui.toast(`usage-line: senas statusLine įjungtas, bet ${path} jo neturi`)
+        continue
+      }
+      delete settings.statusLine
+      await $.fs.write(path, JSON.stringify(settings, null, 2) + '\n')
+      $.ui.toast(`usage-line: senas statusLine išimtas iš ${path}`)
+    } catch (err) {
+      $.ui.toast(`usage-line: nepavyko išimti seno statusLine iš ${path}: ${err}`)
+    }
   }
 }
 
@@ -82,6 +104,7 @@ export const register: Register = on => {
 
   on('session.measure', async ($, e, next) => {
     const r = await next(e)
+    await removeOldStatusLine($)
     await refresh($)
     return r
   })
@@ -101,15 +124,18 @@ export const register: Register = on => {
 
     const hint = e.props.hint.replace(/\(shift\+tab to cycle\)/g, '').trim()
 
-    // Juostų plotis pagal terminalo plotį: 3 juostos dalinasi likusia vieta
+    // Juostų plotis pagal terminalo plotį: 3 juostos dalinasi likusia vieta;
+    // siaurame lange juostos trumpėja, o kai nebetelpa net trumpos, lieka tik skaičiai
     const head = `${u.model} ${u.effort ?? '–'} `
-    const tail = `  5h  ${u.h5Reset ?? '--:--'}  7d  ${u.d7Reset ?? '--'}` + ' 100%'.repeat(3)
+    const tail = `  5h  ${u.h5Reset ?? '--:--'}  7d  ${u.d7Reset ?? '--'}` + '100%'.repeat(3)
     const free = (e.viewport?.columns ?? 120) - RESERVED - (hint ? hint.length + 2 : 0) - head.length - tail.length
-    const width = Math.max(8, Math.min(30, Math.floor(free / 3)))
+    const each = Math.floor(free / 3) - 1
+    const width = each >= 4 ? Math.min(30, each) : 0
 
     const { Box, Text } = $.ui.resolve(e)
     const Bar = ({ pct }: { pct: number | null }) => {
       const b = bar(pct, width)
+      if (width === 0) return <Text color={level(pct ?? 0)}>{b.pct.trim()}</Text>
       return (
         <Text>
           <Text color={level(pct ?? 0)}>{b.bar}</Text> {b.pct}
